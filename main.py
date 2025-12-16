@@ -1,7 +1,7 @@
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 import httpx
 
 app = FastAPI()
@@ -17,7 +17,6 @@ DIGISAC_TOKEN = os.getenv("DIGISAC_TOKEN")
 DIGISAC_SERVICE_ID = os.getenv("DIGISAC_SERVICE_ID")
 
 OMIE_BASE_URL = "https://app.omie.com.br/api/v1"
-
 HEADERS_JSON = {"Content-Type": "application/json"}
 
 
@@ -34,32 +33,36 @@ async def omie_webhook(payload: Dict[str, Any]):
 
     assunto = payload.get("assunto", "")
     if "Financas.ContaReceber" not in assunto:
+        # Webhook de outro assunto – ignoramos
         return {"ok": True, "ignored": True}
 
-    dados = payload.get("dados", {})
+    dados = payload.get("dados", {}) or {}
 
+    # O Omie normalmente manda "codigo_lancamento_omie" no webhook
     titulo_id = (
-        dados.get("nCodTitulo")
-        or dados.get("codigo_lancamento_omie")
+        dados.get("codigo_lancamento_omie")
+        or dados.get("nCodTitulo")
         or dados.get("codigo_titulo")
     )
 
     if not titulo_id:
-        raise HTTPException(400, "Webhook Omie sem código de título")
+        raise HTTPException(400, "Webhook Omie sem código de lançamento (codigo_lancamento_omie).")
 
     # ----------------------------------------------------------
-    # 1) Buscar título no Omie
+    # 1) Buscar título no Omie (ConsultarContaReceber)
+    #    -> usando codigo_lancamento_omie (correto)
     # ----------------------------------------------------------
     titulo = await omie_buscar_titulo(titulo_id)
 
+    # A resposta de ConsultarContaReceber tem um registro único
     boleto_info = titulo.get("boleto") or {}
 
+    # cGerado = "S" significa que existe boleto gerado para esse título
     if boleto_info.get("cGerado") != "S":
-        # Título ainda não possui boleto gerado
         return {"ok": True, "boleto": False}
 
     # ----------------------------------------------------------
-    # 2) Buscar dados completos do boleto
+    # 2) Obter dados completos do boleto (ObterBoleto)
     # ----------------------------------------------------------
     boleto = await omie_obter_boleto(titulo_id)
 
@@ -68,21 +71,23 @@ async def omie_webhook(payload: Dict[str, Any]):
     # ----------------------------------------------------------
     cliente_id = (
         titulo.get("codigo_cliente_omie")
+        or titulo.get("codigo_cliente_fornecedor")
         or titulo.get("nCodCliente")
         or titulo.get("codigo_cliente")
     )
 
     if not cliente_id:
-        raise HTTPException(400, "Título sem cliente associado")
+        raise HTTPException(400, "Título retornado pelo Omie sem cliente associado.")
 
     cliente = await omie_buscar_cliente(cliente_id)
 
     nome_cliente, celular = extrair_dados_cliente(cliente)
 
     if not celular:
+        # Sem WhatsApp válido – não envia, apenas informa
         return {
             "ok": False,
-            "reason": "Cliente sem número válido",
+            "reason": "Cliente sem número de WhatsApp válido",
             "cliente_id": cliente_id,
         }
 
@@ -108,13 +113,22 @@ async def omie_webhook(payload: Dict[str, Any]):
 # FUNÇÕES OMIE
 # --------------------------------------------------------------
 async def omie_buscar_titulo(titulo_id: int):
+    """
+    Consulta uma Conta a Receber pelo codigo_lancamento_omie.
+    (ConsultarContaReceber)
+    """
     url = f"{OMIE_BASE_URL}/financas/contareceber/"
 
     body = {
         "call": "ConsultarContaReceber",
         "app_key": OMIE_APP_KEY,
         "app_secret": OMIE_APP_SECRET,
-        "param": [{"nCodTitulo": titulo_id}],
+        "param": [
+            {
+                "codigo_lancamento_omie": titulo_id,
+                "codigo_lancamento_integracao": ""
+            }
+        ],
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
@@ -122,22 +136,33 @@ async def omie_buscar_titulo(titulo_id: int):
             r = await client.post(url, json=body, headers=HEADERS_JSON)
             r.raise_for_status()
         except httpx.HTTPStatusError as exc:
+            # Devolve um erro claro para você ver pelo Omie / logs
             raise HTTPException(
                 502,
-                detail=f"Erro ao consultar título no Omie: {exc.response.status_code} - {exc.response.text[:300]}"
+                detail=f"Erro ao consultar título no Omie: "
+                       f"{exc.response.status_code} - {exc.response.text[:300]}"
             )
 
     return r.json()
 
 
 async def omie_obter_boleto(titulo_id: int):
+    """
+    Usa o método ObterBoleto na API de contareceberboleto.
+    Aqui SIM é nCodTitulo, conforme documentação oficial.
+    """
     url = f"{OMIE_BASE_URL}/financas/contareceberboleto/"
 
     body = {
         "call": "ObterBoleto",
         "app_key": OMIE_APP_KEY,
         "app_secret": OMIE_APP_SECRET,
-        "param": [{"nCodTitulo": titulo_id}],
+        "param": [
+            {
+                "nCodTitulo": titulo_id,
+                "cCodIntTitulo": ""
+            }
+        ],
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
@@ -147,27 +172,38 @@ async def omie_obter_boleto(titulo_id: int):
         except httpx.HTTPStatusError as exc:
             raise HTTPException(
                 502,
-                detail=f"Erro ao obter boleto no Omie: {exc.response.status_code} - {exc.response.text[:300]}"
+                detail=f"Erro ao obter boleto no Omie: "
+                       f"{exc.response.status_code} - {exc.response.text[:300]}"
             )
 
     data = r.json()
+
+    # A documentação cita "cLinkBoleto" como principal; deixo fallback em outros nomes
+    link = data.get("cLinkBoleto") or data.get("cUrlBoleto") or data.get("urlBoleto")
 
     return {
         "vencimento": data.get("dDtVenc"),
         "valor": data.get("nValorTitulo"),
         "linha": data.get("cLinhaDigitavel"),
-        "link": data.get("cUrlBoleto"),
+        "link": link,
     }
 
 
 async def omie_buscar_cliente(cliente_id: int):
+    """
+    Consulta o cadastro do cliente (ConsultarCliente).
+    """
     url = f"{OMIE_BASE_URL}/geral/clientes/"
 
     body = {
         "call": "ConsultarCliente",
         "app_key": OMIE_APP_KEY,
         "app_secret": OMIE_APP_SECRET,
-        "param": [{"codigo_cliente_omie": cliente_id}],
+        "param": [
+            {
+                "codigo_cliente_omie": cliente_id
+            }
+        ],
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
@@ -177,7 +213,8 @@ async def omie_buscar_cliente(cliente_id: int):
         except httpx.HTTPStatusError as exc:
             raise HTTPException(
                 502,
-                detail=f"Erro ao consultar cliente no Omie: {exc.response.status_code} - {exc.response.text[:300]}"
+                detail=f"Erro ao consultar cliente no Omie: "
+                       f"{exc.response.status_code} - {exc.response.text[:300]}"
             )
 
     return r.json()
@@ -224,7 +261,7 @@ def montar_mensagem_boleto(nome: str, boleto: Dict[str, Any]) -> str:
 async def digisac_enviar(numero: str, texto: str):
 
     if not DIGISAC_SEND_URL or not DIGISAC_TOKEN:
-        raise HTTPException(500, "Configuração da DigiSac ausente")
+        raise HTTPException(500, "Configuração da DigiSac ausente (URL ou TOKEN).")
 
     body = {
         "number": numero,
@@ -247,7 +284,7 @@ async def digisac_enviar(numero: str, texto: str):
 
     try:
         data = r.json()
-    except:
+    except Exception:
         data = r.text
 
     return r.status_code // 100 == 2, data

@@ -7,8 +7,8 @@ app = FastAPI()
 OMIE_APP_KEY = os.getenv("2725566274431")
 OMIE_APP_SECRET = os.getenv("b475d9536c02348d9b16462fb1620c9f")
 
-DIGISAC_TOKEN = os.getenv("DIGISAC_TOKEN")
-DIGISAC_SEND_URL = os.getenv("DIGISAC_SEND_URL")
+DIGISAC_TOKEN = os.getenv("daf1131f232778f865cb2aed3413bf54c76dd913")
+DIGISAC_SEND_URL = os.getenv("https://api.digisac.com.br/v1/messages")
 
 @app.get("/")
 def health():

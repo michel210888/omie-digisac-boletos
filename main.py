@@ -5,41 +5,47 @@ from fastapi import FastAPI, Request, HTTPException
 app = FastAPI()
 
 
+# ===============================
+# HEALTHCHECK
+# ===============================
 @app.get("/")
 def health():
     return {"status": "online"}
 
 
+# ===============================
+# WEBHOOK OMIE
+# ===============================
 @app.post("/webhooks/omie/contas")
 async def omie_webhook(request: Request):
     body = await request.json()
     dados = body.get("dados", {})
 
-    numero_documento = dados.get("numero_documento")
-    if not numero_documento:
+    codigo_lancamento = dados.get("codigo_lancamento_omie")
+    if not codigo_lancamento:
         raise HTTPException(
             400,
-            "Webhook Omie não enviou numero_documento (obrigatório)"
+            "Webhook Omie não enviou codigo_lancamento_omie"
         )
 
-    titulo = await buscar_titulo_por_documento(numero_documento)
+    titulo = await buscar_titulo_por_codigo(codigo_lancamento)
 
     return {
         "ok": True,
         "titulo": {
+            "codigo_lancamento_omie": titulo.get("codigo_lancamento_omie"),
             "numero_documento": titulo.get("numero_documento"),
             "valor": titulo.get("valor_documento"),
             "vencimento": titulo.get("data_vencimento"),
-            "cliente": titulo.get("codigo_cliente_fornecedor"),
-            "codigo_lancamento_omie": titulo.get("codigo_lancamento_omie")
+            "cliente": titulo.get("codigo_cliente_fornecedor")
         }
     }
 
 
 # ==================================================
-# BUSCA CORRETA NO OMIE (CONTRATO REAL)
+# BUSCA ESTÁVEL NO OMIE (FORMA CORRETA)
 # ==================================================
-async def buscar_titulo_por_documento(numero_documento: str):
+async def buscar_titulo_por_codigo(codigo_lancamento_omie: int):
     OMIE_APP_KEY = os.getenv("OMIE_APP_KEY")
     OMIE_APP_SECRET = os.getenv("OMIE_APP_SECRET")
 
@@ -50,6 +56,7 @@ async def buscar_titulo_por_documento(numero_documento: str):
         )
 
     async with httpx.AsyncClient(timeout=30) as client:
+        # Listamos os títulos recentes
         r = await client.post(
             "https://app.omie.com.br/api/v1/financas/contareceber/",
             json={
@@ -58,9 +65,8 @@ async def buscar_titulo_por_documento(numero_documento: str):
                 "app_secret": OMIE_APP_SECRET,
                 "param": [
                     {
-                        "numero_documento": numero_documento,
                         "pagina": 1,
-                        "registros_por_pagina": 10,
+                        "registros_por_pagina": 100,
                         "apenas_importado_api": "N"
                     }
                 ]
@@ -82,10 +88,11 @@ async def buscar_titulo_por_documento(numero_documento: str):
         data = r.json()
         lista = data.get("conta_receber_cadastro", [])
 
-        if not lista:
-            raise HTTPException(
-                404,
-                "Título não encontrado no Omie"
-            )
+        for titulo in lista:
+            if titulo.get("codigo_lancamento_omie") == codigo_lancamento_omie:
+                return titulo
 
-        return lista[0]
+        raise HTTPException(
+            404,
+            "Título não encontrado na listagem do Omie"
+        )
